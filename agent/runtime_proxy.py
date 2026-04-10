@@ -8,6 +8,7 @@ to Amazon Bedrock AgentCore using SigV4 with local AWS credentials.
 import json
 import os
 import urllib.parse
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import boto3
@@ -68,10 +69,13 @@ class RuntimeProxyHandler(BaseHTTPRequestHandler):
         )
 
         runtime_payload = json.dumps({"prompt": prompt})
+        session_id = f"proxy-session-{uuid.uuid4().hex}"
+        trace_id = f"proxy-trace-{uuid.uuid4().hex}"
+
         base_headers = {
             "Content-Type": "application/json",
-            "X-Amzn-Bedrock-AgentCore-Runtime-Session-Id": f"proxy-{os.getpid()}",
-            "X-Amzn-Trace-Id": f"proxy-{os.getpid()}-{id(self)}",
+            "X-Amzn-Bedrock-AgentCore-Runtime-Session-Id": session_id,
+            "X-Amzn-Trace-Id": trace_id,
         }
 
         try:
@@ -127,6 +131,14 @@ class RuntimeProxyHandler(BaseHTTPRequestHandler):
             self._send_json(500, {"error": f"Proxy failure: {exc}"})
 
     def do_GET(self):
+        if self.path == "/":
+            self._send_json(200, {
+                "status": "ok",
+                "message": "Runtime proxy is running. Open frontend at http://localhost:5173",
+                "endpoints": ["/health", "/invocations"],
+            })
+            return
+
         if self.path == "/health":
             self._send_json(200, {"status": "ok"})
             return
