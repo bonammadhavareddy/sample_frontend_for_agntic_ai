@@ -7,11 +7,12 @@ echo "Starting remote-runtime no-auth development mode"
 echo "================================================"
 
 if [ -z "$1" ]; then
-  echo "Usage: $0 <AGENT_RUNTIME_ARN> [REGION]"
+  echo "Usage: $0 <AGENT_RUNTIME_ARN or comma-separated ARNs> [REGION]"
   exit 1
 fi
 
-AGENT_RUNTIME_ARN="$1"
+AGENT_RUNTIME_ARNS="$1"
+AGENT_RUNTIME_ARN="${AGENT_RUNTIME_ARNS%%,*}"
 REGION="${2:-ap-south-1}"
 
 if ! command -v python3 &> /dev/null; then
@@ -71,7 +72,7 @@ trap cleanup SIGINT SIGTERM
 echo "Starting runtime proxy on http://localhost:8080"
 pushd agent > /dev/null
 source venv/bin/activate
-REMOTE_AGENT_RUNTIME_ARN="$AGENT_RUNTIME_ARN" REMOTE_AGENT_REGION="$REGION" python runtime_proxy.py &
+REMOTE_AGENT_RUNTIME_ARN="$AGENT_RUNTIME_ARN" REMOTE_AGENT_RUNTIME_ARNS="$AGENT_RUNTIME_ARNS" REMOTE_AGENT_REGION="$REGION" python runtime_proxy.py &
 PROXY_PID=$!
 popd > /dev/null
 

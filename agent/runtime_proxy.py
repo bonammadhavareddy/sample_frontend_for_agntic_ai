@@ -9,12 +9,46 @@ import json
 import os
 import urllib.parse
 import uuid
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import boto3
 import requests
 from botocore.auth import SigV4Auth
 from botocore.awsrequest import AWSRequest
+
+
+_arn_lock = threading.Lock()
+_arn_index = 0
+
+
+def _parse_runtime_arns():
+    arns_value = os.getenv("REMOTE_AGENT_RUNTIME_ARNS", "").strip()
+    if arns_value:
+        return [arn.strip() for arn in arns_value.split(",") if arn.strip()]
+
+    single_arn = os.getenv("REMOTE_AGENT_RUNTIME_ARN", "").strip()
+    return [single_arn] if single_arn else []
+
+
+def _select_runtime_arn(req_payload):
+    arns = _parse_runtime_arns()
+    if not arns:
+        return None
+
+    # Optional override in request body for quick manual testing.
+    requested_arn = req_payload.get("runtimeArn") if isinstance(req_payload, dict) else None
+    if requested_arn and requested_arn in arns:
+        return requested_arn
+
+    if len(arns) == 1:
+        return arns[0]
+
+    global _arn_index
+    with _arn_lock:
+        selected = arns[_arn_index % len(arns)]
+        _arn_index += 1
+        return selected
 
 
 def _extract_text_from_json(data):
@@ -40,14 +74,8 @@ class RuntimeProxyHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "Not found"})
             return
 
-        runtime_arn = os.getenv("REMOTE_AGENT_RUNTIME_ARN")
+        runtime_arn = _select_runtime_arn({})
         region = os.getenv("REMOTE_AGENT_REGION") or os.getenv("AWS_REGION") or "ap-south-1"
-
-        if not runtime_arn:
-            self._send_json(500, {
-                "error": "Missing REMOTE_AGENT_RUNTIME_ARN environment variable"
-            })
-            return
 
         try:
             content_len = int(self.headers.get("Content-Length", "0"))
@@ -55,6 +83,13 @@ class RuntimeProxyHandler(BaseHTTPRequestHandler):
             req_payload = json.loads(body or "{}")
         except Exception as exc:
             self._send_json(400, {"error": f"Invalid JSON body: {exc}"})
+            return
+
+        runtime_arn = _select_runtime_arn(req_payload)
+        if not runtime_arn:
+            self._send_json(500, {
+                "error": "Missing REMOTE_AGENT_RUNTIME_ARN or REMOTE_AGENT_RUNTIME_ARNS environment variable"
+            })
             return
 
         prompt = req_payload.get("prompt") if isinstance(req_payload, dict) else None
@@ -132,10 +167,13 @@ class RuntimeProxyHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/":
+            runtime_arns = _parse_runtime_arns()
             self._send_json(200, {
                 "status": "ok",
                 "message": "Runtime proxy is running. Open frontend at http://localhost:5173",
                 "endpoints": ["/health", "/invocations"],
+                "runtimeCount": len(runtime_arns),
+                "runtimeArns": runtime_arns,
             })
             return
 
