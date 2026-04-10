@@ -24,16 +24,6 @@ if ! command -v node &> /dev/null; then
   exit 1
 fi
 
-if ! command -v aws &> /dev/null; then
-  echo "AWS CLI is required"
-  exit 1
-fi
-
-if ! aws sts get-caller-identity > /dev/null 2>&1; then
-  echo "AWS credentials not configured. Please run aws configure or aws sso login first."
-  exit 1
-fi
-
 echo "Preparing Python environment..."
 if [ ! -d "agent/venv" ]; then
   pushd agent > /dev/null
@@ -44,6 +34,19 @@ fi
 pushd agent > /dev/null
 source venv/bin/activate
 pip install -r requirements.txt
+
+if ! python - << 'PY'
+import boto3
+try:
+    boto3.client('sts').get_caller_identity()
+except Exception:
+    raise SystemExit(1)
+PY
+then
+  echo "AWS credentials not configured for boto3. Export AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY (and optional AWS_SESSION_TOKEN), or run credentials setup in this shell."
+  exit 1
+fi
+
 popd > /dev/null
 
 echo "Preparing frontend dependencies..."
