@@ -80,7 +80,7 @@ sleep 2
 
 echo "Starting frontend on http://localhost:5173"
 pushd frontend > /dev/null
-npm run dev &
+npm run dev -- --host 0.0.0.0 --port 5173 &
 FRONTEND_PID=$!
 popd > /dev/null
 
