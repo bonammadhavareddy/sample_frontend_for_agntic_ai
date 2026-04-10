@@ -127,6 +127,32 @@ This will:
 
 **Note:** Agent restart takes ~10 seconds vs ~10 minutes for production deployment.
 
+## Run Deployed Runtime Without Cognito (Dev Proxy Mode)
+
+If you want to test a deployed AgentCore runtime from the local frontend without setting up Cognito in the browser, use the proxy mode.
+
+What this mode does:
+- Runs frontend locally on `http://localhost:5173`
+- Runs a local proxy on `http://localhost:8080`
+- Proxy signs runtime requests with your local AWS credentials (SigV4)
+- Frontend stays in `VITE_LOCAL_DEV=true` mode (no Cognito UI/token flow)
+
+Run it:
+
+```bash
+chmod +x dev-remote-noauth.sh
+./dev-remote-noauth.sh arn:aws:bedrock-agentcore:ap-south-1:873461662314:runtime/ai_a2a_aps1_dev_agentcore_rag_agent-xrDlE2HVX1 ap-south-1
+```
+
+Requirements:
+- AWS credentials available locally (`aws sts get-caller-identity` must work)
+- Runtime IAM/auth policy must allow your caller identity to invoke the runtime
+
+Files involved:
+- `dev-remote-noauth.sh`
+- `agent/runtime_proxy.py`
+- `frontend/.env.local` (auto-written by script)
+
 ## Stack Architecture
 
 | Stack Name | Purpose | Key Resources |

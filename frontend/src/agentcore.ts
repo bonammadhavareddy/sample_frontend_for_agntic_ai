@@ -40,8 +40,9 @@ export const invokeAgent = async (request: InvokeAgentRequest): Promise<InvokeAg
         throw new Error(`Local AgentCore invocation failed: ${response.status} ${response.statusText} - ${errorText}`);
       }
 
-      // Check if streaming callback is provided
-      if (request.onChunk && response.body) {
+      // Stream only when backend returns SSE
+      const isSseResponse = response.headers.get('content-type')?.includes('text/event-stream');
+      if (request.onChunk && response.body && isSseResponse) {
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
         let fullResponse = '';
@@ -162,8 +163,9 @@ export const invokeAgent = async (request: InvokeAgentRequest): Promise<InvokeAg
       throw new Error(`AgentCore invocation failed: ${response.status} ${response.statusText} - ${errorText}`);
     }
 
-    // Check if streaming callback is provided
-    if (request.onChunk && response.body) {
+    // Stream only when AgentCore returns SSE
+    const isSseResponse = response.headers.get('content-type')?.includes('text/event-stream');
+    if (request.onChunk && response.body && isSseResponse) {
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let fullResponse = '';
