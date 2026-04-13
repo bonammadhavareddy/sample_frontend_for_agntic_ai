@@ -66,6 +66,15 @@ def _extract_text_from_json(data):
     return ""
 
 
+def _extract_region_from_arn(arn):
+    if not arn or ":" not in arn:
+        return None
+    parts = arn.split(":")
+    if len(parts) < 4:
+        return None
+    return parts[3] or None
+
+
 class RuntimeProxyHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -73,9 +82,6 @@ class RuntimeProxyHandler(BaseHTTPRequestHandler):
         if self.path != "/invocations":
             self._send_json(404, {"error": "Not found"})
             return
-
-        runtime_arn = _select_runtime_arn({})
-        region = os.getenv("REMOTE_AGENT_REGION") or os.getenv("AWS_REGION") or "ap-south-1"
 
         try:
             content_len = int(self.headers.get("Content-Length", "0"))
@@ -91,6 +97,15 @@ class RuntimeProxyHandler(BaseHTTPRequestHandler):
                 "error": "Missing REMOTE_AGENT_RUNTIME_ARN or REMOTE_AGENT_RUNTIME_ARNS environment variable"
             })
             return
+
+        configured_region = os.getenv("REMOTE_AGENT_REGION") or os.getenv("AWS_REGION")
+        arn_region = _extract_region_from_arn(runtime_arn)
+        if configured_region and arn_region and configured_region != arn_region:
+            print(
+                "WARNING: configured region does not match runtime ARN region "
+                f"(configured={configured_region}, arn={arn_region}). Using ARN region."
+            )
+        region = arn_region or configured_region or "ap-south-1"
 
         prompt = req_payload.get("prompt") if isinstance(req_payload, dict) else None
         if not prompt:
@@ -120,6 +135,12 @@ class RuntimeProxyHandler(BaseHTTPRequestHandler):
                 self._send_json(500, {"error": "AWS credentials not found"})
                 return
 
+            caller_arn = None
+            try:
+                caller_arn = session.client("sts").get_caller_identity().get("Arn")
+            except Exception:
+                caller_arn = None
+
             frozen = creds.get_frozen_credentials()
             aws_request = AWSRequest(method="POST", url=url, data=runtime_payload, headers=base_headers)
             SigV4Auth(frozen, "bedrock-agentcore", region).add_auth(aws_request)
@@ -128,9 +149,21 @@ class RuntimeProxyHandler(BaseHTTPRequestHandler):
             response = requests.post(url, data=runtime_payload, headers=signed_headers, timeout=120)
 
             if not response.ok:
+                request_id = response.headers.get("x-amzn-requestid") or response.headers.get("x-amz-request-id")
+                hint = None
+                if response.status_code == 403:
+                    hint = (
+                        "Access denied by AgentCore. Ensure this caller is allowed in the runtime resource policy "
+                        "and that the runtime ARN/region are correct."
+                    )
                 self._send_json(response.status_code, {
                     "error": "AgentCore invocation failed",
                     "status": response.status_code,
+                    "runtimeArn": runtime_arn,
+                    "region": region,
+                    "callerArn": caller_arn,
+                    "requestId": request_id,
+                    "hint": hint,
                     "details": response.text,
                 })
                 return

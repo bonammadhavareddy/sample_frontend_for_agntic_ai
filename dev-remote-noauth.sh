@@ -13,7 +13,21 @@ fi
 
 AGENT_RUNTIME_ARNS="$1"
 AGENT_RUNTIME_ARN="${AGENT_RUNTIME_ARNS%%,*}"
-REGION="${2:-ap-south-1}"
+ARN_REGION="$(printf '%s' "$AGENT_RUNTIME_ARN" | cut -d: -f4)"
+
+if [ -n "$2" ]; then
+  REGION="$2"
+elif [ -n "$ARN_REGION" ]; then
+  REGION="$ARN_REGION"
+else
+  REGION="ap-south-1"
+fi
+
+if [ -n "$ARN_REGION" ] && [ "$REGION" != "$ARN_REGION" ]; then
+  echo "WARNING: Region override '$REGION' does not match runtime ARN region '$ARN_REGION'."
+  echo "Using runtime ARN region '$ARN_REGION' to avoid signed-request mismatches."
+  REGION="$ARN_REGION"
+fi
 
 if ! command -v python3 &> /dev/null; then
   echo "Python 3 is required"
@@ -26,6 +40,8 @@ if ! command -v node &> /dev/null; then
 fi
 
 echo "Preparing Python environment..."
+echo "Using runtime ARN: $AGENT_RUNTIME_ARN"
+echo "Using runtime region: $REGION"
 if [ ! -d "agent/venv" ]; then
   pushd agent > /dev/null
   python3 -m venv venv
