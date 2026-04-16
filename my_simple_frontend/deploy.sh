@@ -13,9 +13,50 @@ if [ ! -f .env ]; then
   exit 1
 fi
 
-# Parse VITE_AGENT_RUNTIME_ARNS and REGION from .env (ignore comments/blank lines)
+# Parse VITE_AGENT_RUNTIME_ARNS, REGION, and optional timeouts from .env
 AGENT_RUNTIME_ARNS=$(grep -E '^VITE_AGENT_RUNTIME_ARNS=' .env | head -1 | cut -d'=' -f2-)
 REGION=$(grep -E '^REGION=' .env | head -1 | cut -d'=' -f2-)
+AGENTCORE_HTTP_TIMEOUT_SECONDS=$(grep -E '^AGENTCORE_HTTP_TIMEOUT_SECONDS=' .env | head -1 | cut -d'=' -f2-)
+AGENTCORE_ASYNC_HTTP_TIMEOUT_SECONDS=$(grep -E '^AGENTCORE_ASYNC_HTTP_TIMEOUT_SECONDS=' .env | head -1 | cut -d'=' -f2-)
+
+# Default to a safe high value for API Gateway/CloudFront path
+if [ -z "$AGENTCORE_HTTP_TIMEOUT_SECONDS" ]; then
+  AGENTCORE_HTTP_TIMEOUT_SECONDS=28
+fi
+
+# Keep within safe gateway limits
+case "$AGENTCORE_HTTP_TIMEOUT_SECONDS" in
+  ''|*[!0-9]*)
+    echo "WARN: AGENTCORE_HTTP_TIMEOUT_SECONDS must be numeric. Using 28."
+    AGENTCORE_HTTP_TIMEOUT_SECONDS=28
+    ;;
+esac
+if [ "$AGENTCORE_HTTP_TIMEOUT_SECONDS" -gt 29 ]; then
+  echo "WARN: AGENTCORE_HTTP_TIMEOUT_SECONDS > 29 is not safe for API Gateway path. Capping to 29."
+  AGENTCORE_HTTP_TIMEOUT_SECONDS=29
+fi
+if [ "$AGENTCORE_HTTP_TIMEOUT_SECONDS" -lt 1 ]; then
+  echo "WARN: AGENTCORE_HTTP_TIMEOUT_SECONDS < 1 is invalid. Using 1."
+  AGENTCORE_HTTP_TIMEOUT_SECONDS=1
+fi
+
+if [ -z "$AGENTCORE_ASYNC_HTTP_TIMEOUT_SECONDS" ]; then
+  AGENTCORE_ASYNC_HTTP_TIMEOUT_SECONDS=120
+fi
+case "$AGENTCORE_ASYNC_HTTP_TIMEOUT_SECONDS" in
+  ''|*[!0-9]*)
+    echo "WARN: AGENTCORE_ASYNC_HTTP_TIMEOUT_SECONDS must be numeric. Using 120."
+    AGENTCORE_ASYNC_HTTP_TIMEOUT_SECONDS=120
+    ;;
+esac
+if [ "$AGENTCORE_ASYNC_HTTP_TIMEOUT_SECONDS" -gt 840 ]; then
+  echo "WARN: AGENTCORE_ASYNC_HTTP_TIMEOUT_SECONDS > 840 is too high. Capping to 840."
+  AGENTCORE_ASYNC_HTTP_TIMEOUT_SECONDS=840
+fi
+if [ "$AGENTCORE_ASYNC_HTTP_TIMEOUT_SECONDS" -lt 5 ]; then
+  echo "WARN: AGENTCORE_ASYNC_HTTP_TIMEOUT_SECONDS < 5 is invalid. Using 5."
+  AGENTCORE_ASYNC_HTTP_TIMEOUT_SECONDS=5
+fi
 
 if [ -z "$AGENT_RUNTIME_ARNS" ]; then
   echo "ERROR: VITE_AGENT_RUNTIME_ARNS is not set in .env"
@@ -29,12 +70,15 @@ fi
 STACK_NAME="agentcore-frontend"
 LAMBDA_NAME="${STACK_NAME}-proxy"
 ROLE_NAME="${STACK_NAME}-lambda-role"
+JOBS_TABLE_NAME="${STACK_NAME}-jobs"
 STATE_FILE=".deploy-state"
 
 cd "$(dirname "$0")"
 
 echo "=== AgentCore Chat Deployment ==="
 echo "Region : $REGION"
+echo "AgentCore timeout (s): $AGENTCORE_HTTP_TIMEOUT_SECONDS"
+echo "AgentCore async timeout (s): $AGENTCORE_ASYNC_HTTP_TIMEOUT_SECONDS"
 
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 BUCKET_NAME="${STACK_NAME}-${ACCOUNT_ID}"
@@ -62,9 +106,27 @@ aws s3api put-public-access-block --bucket "$BUCKET_NAME" \
   --public-access-block-configuration \
   BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
 
-# ── 3. IAM role ────────────────────────────────────────────────────────────────
+# ── 3. DynamoDB jobs table (async status storage) ─────────────────────────────
 echo ""
-echo "[3/7] IAM role: $ROLE_NAME"
+echo "[3/8] DynamoDB table: $JOBS_TABLE_NAME"
+if ! aws dynamodb describe-table --table-name "$JOBS_TABLE_NAME" --region "$REGION" > /dev/null 2>&1; then
+  aws dynamodb create-table \
+    --table-name "$JOBS_TABLE_NAME" \
+    --attribute-definitions AttributeName=requestId,AttributeType=S \
+    --key-schema AttributeName=requestId,KeyType=HASH \
+    --billing-mode PAY_PER_REQUEST \
+    --region "$REGION" > /dev/null
+  aws dynamodb wait table-exists --table-name "$JOBS_TABLE_NAME" --region "$REGION"
+  aws dynamodb update-time-to-live \
+    --table-name "$JOBS_TABLE_NAME" \
+    --time-to-live-specification "Enabled=true,AttributeName=expiresAt" \
+    --region "$REGION" > /dev/null || true
+  echo "  Table created."
+fi
+
+# ── 4. IAM role ────────────────────────────────────────────────────────────────
+echo ""
+echo "[4/8] IAM role: $ROLE_NAME"
 if ! aws iam get-role --role-name "$ROLE_NAME" > /dev/null 2>&1; then
   TRUST='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
   aws iam create-role --role-name "$ROLE_NAME" \
@@ -88,9 +150,13 @@ aws iam put-role-policy --role-name "$ROLE_NAME" \
   --policy-name AgentCoreInvoke \
   --policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"bedrock-agentcore:InvokeAgentRuntime\",\"Resource\":${POLICY_RESOURCES}}]}"
 
-# ── 4. Lambda function ─────────────────────────────────────────────────────────
+aws iam put-role-policy --role-name "$ROLE_NAME" \
+  --policy-name JobsTableAccess \
+  --policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"dynamodb:GetItem\",\"dynamodb:PutItem\",\"dynamodb:UpdateItem\"],\"Resource\":\"arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/${JOBS_TABLE_NAME}\"}]}"
+
+# ── 5. Lambda function ─────────────────────────────────────────────────────────
 echo ""
-echo "[4/7] Lambda function: $LAMBDA_NAME"
+echo "[5/8] Lambda function: $LAMBDA_NAME"
 (cd lambda && zip -q ../lambda.zip index.py)
 
 if aws lambda get-function --function-name "$LAMBDA_NAME" --region "$REGION" > /dev/null 2>&1; then
@@ -103,7 +169,8 @@ if aws lambda get-function --function-name "$LAMBDA_NAME" --region "$REGION" > /
     --function-name "$LAMBDA_NAME" --region "$REGION"
   aws lambda update-function-configuration \
     --function-name "$LAMBDA_NAME" \
-    --environment "{\"Variables\":{\"AGENT_RUNTIME_ARNS\":\"${AGENT_RUNTIME_ARNS}\"}}" \
+    --timeout 180 \
+    --environment "{\"Variables\":{\"AGENT_RUNTIME_ARNS\":\"${AGENT_RUNTIME_ARNS}\",\"AGENTCORE_HTTP_TIMEOUT_SECONDS\":\"${AGENTCORE_HTTP_TIMEOUT_SECONDS}\",\"AGENTCORE_ASYNC_HTTP_TIMEOUT_SECONDS\":\"${AGENTCORE_ASYNC_HTTP_TIMEOUT_SECONDS}\",\"JOBS_TABLE_NAME\":\"${JOBS_TABLE_NAME}\"}}" \
     --region "$REGION" > /dev/null
 else
   echo "  Creating new function..."
@@ -113,13 +180,20 @@ else
     --role "$ROLE_ARN" \
     --handler index.handler \
     --zip-file fileb://lambda.zip \
-    --timeout 60 \
-    --environment "{\"Variables\":{\"AGENT_RUNTIME_ARNS\":\"${AGENT_RUNTIME_ARNS}\"}}" \
+    --timeout 180 \
+    --environment "{\"Variables\":{\"AGENT_RUNTIME_ARNS\":\"${AGENT_RUNTIME_ARNS}\",\"AGENTCORE_HTTP_TIMEOUT_SECONDS\":\"${AGENTCORE_HTTP_TIMEOUT_SECONDS}\",\"AGENTCORE_ASYNC_HTTP_TIMEOUT_SECONDS\":\"${AGENTCORE_ASYNC_HTTP_TIMEOUT_SECONDS}\",\"JOBS_TABLE_NAME\":\"${JOBS_TABLE_NAME}\"}}" \
     --region "$REGION" > /dev/null
   aws lambda wait function-active \
     --function-name "$LAMBDA_NAME" --region "$REGION"
 fi
 rm -f lambda.zip
+
+LAMBDA_ARN_FULL=$(aws lambda get-function --function-name "$LAMBDA_NAME" \
+  --region "$REGION" --query Configuration.FunctionArn --output text)
+
+aws iam put-role-policy --role-name "$ROLE_NAME" \
+  --policy-name SelfInvoke \
+  --policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"lambda:InvokeFunction\",\"Resource\":\"${LAMBDA_ARN_FULL}\"}]}"
 
 # ── API Gateway HTTP API ───────────────────────────────────────────────────────
 API_NAME="${STACK_NAME}-api"
@@ -135,28 +209,13 @@ if [ -z "$API_ID" ]; then
     --region "$REGION" \
     --query ApiId --output text)
 
-  LAMBDA_ARN=$(aws lambda get-function --function-name "$LAMBDA_NAME" \
-    --region "$REGION" --query Configuration.FunctionArn --output text)
-
   INTEGRATION_ID=$(aws apigatewayv2 create-integration \
     --api-id "$API_ID" \
     --integration-type AWS_PROXY \
-    --integration-uri "$LAMBDA_ARN" \
+    --integration-uri "$LAMBDA_ARN_FULL" \
     --payload-format-version 2.0 \
     --region "$REGION" \
     --query IntegrationId --output text)
-
-  aws apigatewayv2 create-route \
-    --api-id "$API_ID" \
-    --route-key "POST /api/invocations" \
-    --target "integrations/${INTEGRATION_ID}" \
-    --region "$REGION" > /dev/null
-
-  aws apigatewayv2 create-route \
-    --api-id "$API_ID" \
-    --route-key "OPTIONS /api/invocations" \
-    --target "integrations/${INTEGRATION_ID}" \
-    --region "$REGION" > /dev/null
 
   aws apigatewayv2 create-stage \
     --api-id "$API_ID" \
@@ -164,21 +223,56 @@ if [ -z "$API_ID" ]; then
     --auto-deploy \
     --region "$REGION" > /dev/null
 
-  LAMBDA_ARN_FULL=$(aws lambda get-function --function-name "$LAMBDA_NAME" \
-    --region "$REGION" --query Configuration.FunctionArn --output text)
-
-  aws lambda add-permission \
-    --function-name "$LAMBDA_NAME" \
-    --statement-id apigw-invoke \
-    --action lambda:InvokeFunction \
-    --principal apigateway.amazonaws.com \
-    --source-arn "arn:aws:execute-api:${REGION}:${ACCOUNT_ID}:${API_ID}/*/*/api/invocations" \
-    --region "$REGION" > /dev/null 2>&1 || true
-
   echo "  API Gateway ID: $API_ID"
 else
   echo "  API Gateway already exists: $API_ID"
 fi
+
+INTEGRATION_ID=$(aws apigatewayv2 get-integrations \
+  --api-id "$API_ID" \
+  --region "$REGION" \
+  --query "Items[?IntegrationUri=='${LAMBDA_ARN_FULL}'].IntegrationId | [0]" \
+  --output text)
+
+if [ -z "$INTEGRATION_ID" ] || [ "$INTEGRATION_ID" = "None" ]; then
+  INTEGRATION_ID=$(aws apigatewayv2 create-integration \
+    --api-id "$API_ID" \
+    --integration-type AWS_PROXY \
+    --integration-uri "$LAMBDA_ARN_FULL" \
+    --payload-format-version 2.0 \
+    --region "$REGION" \
+    --query IntegrationId --output text)
+fi
+
+ensure_route() {
+  local route_key="$1"
+  local route_id
+  route_id=$(aws apigatewayv2 get-routes \
+    --api-id "$API_ID" \
+    --region "$REGION" \
+    --query "Items[?RouteKey=='${route_key}'].RouteId | [0]" \
+    --output text)
+
+  if [ -z "$route_id" ] || [ "$route_id" = "None" ]; then
+    aws apigatewayv2 create-route \
+      --api-id "$API_ID" \
+      --route-key "$route_key" \
+      --target "integrations/${INTEGRATION_ID}" \
+      --region "$REGION" > /dev/null
+  fi
+}
+
+ensure_route "POST /api/invocations"
+ensure_route "OPTIONS /api/invocations"
+ensure_route "GET /api/invocations/{requestId}"
+
+aws lambda add-permission \
+  --function-name "$LAMBDA_NAME" \
+  --statement-id apigw-invoke-apiwildcard \
+  --action lambda:InvokeFunction \
+  --principal apigateway.amazonaws.com \
+  --source-arn "arn:aws:execute-api:${REGION}:${ACCOUNT_ID}:${API_ID}/*/*/api/*" \
+  --region "$REGION" > /dev/null 2>&1 || true
 
 API_HOST="${API_ID}.execute-api.${REGION}.amazonaws.com"
 echo "  API host: $API_HOST"
@@ -308,9 +402,9 @@ STEOF
   }"
 fi
 
-# ── 7. Upload frontend to S3 ───────────────────────────────────────────────────
+# ── 8. Upload frontend to S3 ───────────────────────────────────────────────────
 echo ""
-echo "[7/7] Uploading frontend to S3..."
+echo "[8/8] Uploading frontend to S3..."
 aws s3 sync dist/ "s3://${BUCKET_NAME}/" --delete
 
 # Invalidate CloudFront cache if distribution already existed

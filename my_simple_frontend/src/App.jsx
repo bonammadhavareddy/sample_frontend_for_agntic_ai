@@ -3,6 +3,10 @@ import './App.css';
 import aiBrainImg from './images/ai_brain.png';
 
 const AGENT_URL = '/api/invocations';
+const POLL_INTERVAL_MS = 2000;
+const POLL_MAX_ATTEMPTS = 90;
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const AGENTS = (import.meta.env.VITE_AGENT_RUNTIME_ARNS || '')
   .split(',')
@@ -162,19 +166,65 @@ export default function App() {
     setMessages((prev) => [...prev, { role: 'user', text, id: Date.now() }]);
     setLoading(true);
     try {
-      const res = await fetch(AGENT_URL, {
+      const submitRes = await fetch(AGENT_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ prompt: text, runtimeArn: selectedArn }),
       });
-      const raw = await res.text();
-      if (!res.ok) throw new Error(`Server error ${res.status}: ${raw}`);
-      let reply = raw;
+
+      const submitRaw = await submitRes.text();
+      if (!submitRes.ok) throw new Error(`Server error ${submitRes.status}: ${submitRaw}`);
+
+      let submitData = {};
       try {
-        const data = JSON.parse(raw);
-        reply = typeof data === 'string' ? data
-          : data.response ?? data.content ?? data.text ?? data.message ?? data.output ?? raw;
-      } catch { /* raw text */ }
+        submitData = JSON.parse(submitRaw);
+      } catch {
+        submitData = {};
+      }
+
+      // Backward compatibility if backend returns immediate response.
+      if (submitData?.response) {
+        setMessages((prev) => [...prev, { role: 'agent', text: submitData.response, id: Date.now() }]);
+        return;
+      }
+
+      const requestId = submitData?.requestId;
+      if (!requestId) {
+        throw new Error(`Unexpected submit response: ${submitRaw}`);
+      }
+
+      let reply = '';
+      for (let i = 0; i < POLL_MAX_ATTEMPTS; i += 1) {
+        const pollRes = await fetch(`${AGENT_URL}/${encodeURIComponent(requestId)}`);
+        const pollRaw = await pollRes.text();
+        if (!pollRes.ok) {
+          throw new Error(`Status error ${pollRes.status}: ${pollRaw}`);
+        }
+
+        let pollData = {};
+        try {
+          pollData = JSON.parse(pollRaw);
+        } catch {
+          pollData = {};
+        }
+
+        const status = pollData?.status;
+        if (status === 'COMPLETED') {
+          reply = pollData.response || '';
+          break;
+        }
+
+        if (status === 'FAILED') {
+          throw new Error(pollData.error || 'Async request failed');
+        }
+
+        await sleep(POLL_INTERVAL_MS);
+      }
+
+      if (!reply) {
+        throw new Error('Request is still processing. Please try again in a moment.');
+      }
+
       setMessages((prev) => [...prev, { role: 'agent', text: reply, id: Date.now() }]);
     } catch (err) {
       setError(err.message);

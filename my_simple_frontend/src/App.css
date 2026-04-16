@@ -32,12 +32,13 @@ body {
   font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', sans-serif;
   background: var(--bg);
   color: var(--text);
-  height: 100dvh;
-  overflow: hidden;
+  min-height: 100dvh;
+  overflow-x: hidden;
+  overflow-y: auto;
   transition: background 0.25s, color 0.25s;
 }
 
-#root { height: 100dvh; }
+#root { min-height: 100dvh; }
 
 button { cursor: pointer; border: none; background: none; color: inherit; }
 textarea { font-family: inherit; }
@@ -45,8 +46,7 @@ textarea { font-family: inherit; }
 /* ── App shell ───────────────────────────────────────────────────────────── */
 .app {
   display: flex;
-  height: 100dvh;
-  overflow: hidden;
+  min-height: 100dvh;
 }
 
 /* ── Sidebar ─────────────────────────────────────────────────────────────── */
@@ -210,7 +210,7 @@ textarea { font-family: inherit; }
   display: flex;
   flex-direction: column;
   min-width: 0;
-  height: 100dvh;
+  min-height: 100dvh;
 }
 
 /* ── Topbar ──────────────────────────────────────────────────────────────── */
